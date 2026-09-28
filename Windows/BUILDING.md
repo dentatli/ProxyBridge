@@ -21,8 +21,7 @@ Signed packaging is a separate entry point:
 `Windows/installer/build-signed-package.ps1`. Supply its explicit manifest,
 launcher and publisher hashes, versions, verified signed payload, SignTool,
 MakeNSIS, timestamp service and a new destination. Existing verification must
-succeed; compile.ps1 never signs or creates certificates. The transaction
-installer remains rehearsal-only pending physical/release gates.
+succeed; compile.ps1 never signs or creates certificates. Production release automation remains gated pending signing integration.
 
 The normal Windows CI job builds user mode only, including PRs to Driver.
 GitHub-hosted execution is not yet verified by the local build.
@@ -66,28 +65,37 @@ manifest bytes before NSIS. It signs generated uninstaller and final setup.
 
 The result is one ProxyBridge-Setup.exe containing app and driver. The current
 NSIS gate still marks it as a rehearsal; do not publish as a production release
-until the recorded release gates are completed. There is no automatic Microsoft
+until production signing and release integration are completed. There is no automatic Microsoft
 submission/download step and no dependency on signing private keys in ordinary CI.
-# Installed layout (current rehearsal implementation)
+## Installed layout and lifecycle
 
-Native registration creates `ProxyBridge.lnk` in the common Start menu folder
-and on the common desktop, targeting the verified bootstrap launcher with its
-embedded icon. Updates retarget owned links; uninstall removes matching links.
-A link changed to a foreign target is preserved and reported as a registration
-error. The shared desktop must not grant effective write access to ordinary users;
-the installer checks this but does not change its Windows ACL.
+Setup installs one application in `%ProgramFiles%\InterceptSuite\ProxyBridge`.
+The GUI, CLI, core, launcher, helper, uninstaller and driver package inputs live
+there. Updates overwrite that directory; no previous application versions or
+rollback copies are retained. Windows manages the installed driver separately
+in its Driver Store. User profiles remain user data.
 
-New application payloads use `%ProgramFiles%\InterceptSuite\ProxyBridge\versions\{transaction-guid}`.
-Version directories support transactional update and rollback. Bootstrap/recovery
-executables remain under `%ProgramData%\InterceptSuite.ProxyBridge\bootstrap`.
-Existing receipts for the former ProgramData `versions` directory remain readable
-and eligible for validated cleanup; installation does not relocate old files in place.
-Legacy fallback is limited to that fixed protected directory. Access-denied or
-invalid-security errors at the new root are not treated as a missing installation.
+Start menu/Desktop shortcuts and the startup task use the fixed installation
+folder. Registration and cleanup verify ownership before changing existing
+files or links. Migration removes recognized legacy `versions` and ProgramData
+bootstrap files; unknown files and foreign shortcuts are preserved.
 
-This layout is being replaced. It does not meet the product requirement of a
-single conventional Program Files installation and has outstanding PB-SUT
-uninstall/reinstall regressions. See
-[`installer/KNOWN-ISSUES.md`](installer/KNOWN-ISSUES.md) before using a
-rehearsal installer for product validation.
+Interrupted installation remains launch-blocked until Setup is run again with
+a complete signed payload. The journal, signature validation and recovery code
+are required runtime components, not development tests.
 
+Uninstall removes application files, registration and owned shortcuts even when
+Windows retains the removed driver's service until restart. In that case the
+wizard's final page requests a reboot; reboot before reinstalling. Do not
+manually delete Driver Store files or unrelated service entries.
+
+## Validation
+
+CI compiles unsigned user-mode components. Before distributing a build, verify
+the signed package and exercise install, update, uninstall/reboot/reinstall and
+TCP/UDP traffic on a dedicated Windows test machine. Driver changes also require
+the applicable HLK checks and DVL evidence; preserve `driver/create-dvl.ps1` for
+that workflow. Passing local compilation is not proof of runtime or HLK success.
+
+Developer test/benchmark harnesses and historical installer reports are retained
+in Git history (`codex/windows-full-20260927`), not in the distributable branch.

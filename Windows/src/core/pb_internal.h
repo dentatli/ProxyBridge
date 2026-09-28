@@ -109,25 +109,6 @@ typedef struct CONNECTION_INFO {
 } CONNECTION_INFO;
 
 typedef struct {
-    SOCKET from_socket;
-    SOCKET to_socket;
-} TRANSFER_CONFIG;
-
-// Two-thread bidirectional relay: each direction runs in its own thread so
-// a slow proxy (upload) never stalls the download pipe and vice-versa.
-typedef struct {
-    SOCKET sock_client;   // app-side socket
-    SOCKET sock_proxy;    // proxy-side socket
-    volatile LONG refs;   // ref-count; last thread out closes both sockets
-} RELAY_PAIR;
-
-typedef struct {
-    RELAY_PAIR *pair;
-    SOCKET from;
-    SOCKET to;
-} ONE_WAY_CONFIG;
-
-typedef struct {
     DWORD pid;
     UINT8 address[16];
     UINT16 dest_port;
@@ -392,8 +373,6 @@ DWORD WINAPI local_proxy_server(LPVOID arg);
 BOOL pb_tcp_is_worker_thread(void);
 void pb_tcp_stop_workers(void);
 BOOL pb_tcp_start_workers(void);
-DWORD WINAPI one_way_relay(LPVOID arg); // legacy byte-pump reference fixture only
-DWORD WINAPI transfer_handler(LPVOID arg);
 
 // ---- ProxyBridge.c ----
 DWORD WINAPI cleanup_worker(LPVOID arg);

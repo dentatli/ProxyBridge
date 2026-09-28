@@ -54,10 +54,6 @@ $SourceFiles = ($SourceFile.Split(' ') | ForEach-Object { "$SourcePath\$_" }) -j
 $OutputDLL = "ProxyBridgeCore.dll"
 $OutputDir = $output
 
-$SignTool = "signtool.exe"
-$CertThumbprint = ""
-$TimestampServer = "http://timestamp.digicert.com"
-
 $Arch = if ([Environment]::Is64BitProcess) { "x64" } else { "x86" }
 Write-Host "Architecture: $Arch" -ForegroundColor Cyan
 
@@ -89,7 +85,7 @@ function Compile-MSVC {
 
     $clArgs = "/nologo /utf-8 /O2 /MT /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
               "/D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
-              "/arch:SSE2 /fp:fast /GS /guard:cf /Qpar " +
+              "/fp:fast /GS /guard:cf /Qpar " +
               "/I`"$SourcePath\core`" /I`"$SourcePath\driver`" " +
               "$SourceFiles " +
               "/LD " +
@@ -204,7 +200,7 @@ if ($success) {
     if ($script:foundVcvarsPath -and (Test-Path $script:foundVcvarsPath)) {
         $cliArgs = "/nologo /utf-8 /O2 /MT /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
                    "/D_WINSOCK_DEPRECATED_NO_WARNINGS /D_WIN32_WINNT=0x0601 /DNDEBUG " +
-                   "/arch:SSE2 /fp:fast /GS /guard:cf /Qpar " +
+                   "/fp:fast /GS /guard:cf /Qpar " +
                    "cli\main.c " +
                    "/link /LTCG /OPT:REF /OPT:ICF /RELEASE /DYNAMICBASE /NXCOMPAT /SUBSYSTEM:CONSOLE " +
                    "winhttp.lib shell32.lib advapi32.lib " +

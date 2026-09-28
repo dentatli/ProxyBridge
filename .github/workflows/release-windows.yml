@@ -6,13 +6,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-and-release:
     runs-on: self-hosted
     permissions:
-      contents: write
+      contents: read
       actions: read
     if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner)
 
@@ -20,36 +20,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-    # Keep release fail-closed until production inputs and PB-SUT gates are complete.
+    # Keep release fail-closed until production signing and release integration are complete.
     - name: Require production PnP release integration
       run: throw 'PnP release packaging is gated. Use installer/build-signed-package.ps1 with explicitly verified inputs for rehearsal; unsigned CI output is not a release.'
       shell: pwsh
-
-    - name: Build and sign project
-      run: .\compile.ps1
-      working-directory: Windows
-      shell: pwsh
-
-    - name: List built files
-      run: |
-        Write-Host "`nBuild artifacts:"
-        Get-ChildItem Windows/output -Recurse | ForEach-Object {
-          $size = [math]::Round($_.Length/1MB, 2)
-          Write-Host "  $($_.Name) - $size MB"
-        }
-      shell: pwsh
-
-    - name: Upload installer to release
-      if: github.event_name == 'release'
-      run: |
-        gh release upload "${{ github.event.release.tag_name }}" (Get-ChildItem Windows/output/ProxyBridge-Setup-*.exe) --clobber
-      shell: pwsh
-      env:
-        GH_TOKEN: ${{ github.token }}
-
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-      with:
-        name: ProxyBridge-Release-${{ github.event.release.tag_name }}
-        path: Windows/output/
-        retention-days: 90
