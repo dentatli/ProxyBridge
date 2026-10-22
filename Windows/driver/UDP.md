@@ -80,22 +80,38 @@ other replies retain transport receive. Separate network injection handles are
 checked for self-injection and drained/destroyed on teardown. Last injection
 failure status, stage and routing metadata are exposed with the counters.
 
-The bounded physical trial passed 12/12 IPv4/IPv6 socket/bind variants and the
-two-clients/one-origin isolation check, with matching signed SYS/Core identities
-and verified rollback. This is a functional gate, not a throughput or resource
-benchmark; non-loopback receive injection and the remaining cases below still
-require validation.
+The physical trials passed 12/12 IPv4/IPv6 socket/bind variants and the
+two-clients/one-origin isolation check. The final 1.1.0.0 package additionally
+passed 39/39 Core correctness cases, with 42/42 direct and 42/42 explicit SOCKS
+controls: zero/1/1200/8192/65000-byte payloads, software loopback and the target's
+own LAN address, two destinations on one socket, delayed replies across endpoint
+reuse, UDP DIRECT/BLOCK, and isolation of a stalled proxy handshake. A healthy
+route on the same socket continued before and after the other route's timeout.
+The stalled packet was not sent directly. Normal and fault probes stopped
+without remaining helper threads or forced cleanup.
 
-Release Core/CLI and KMDF compile/link, standalone INF verification and native
-driver code analysis are performed in the TestLab checkout. Lab-only probes
-exercise actual Core IOCP/SOCKS code through a simulated device seam and the
-actual packet builder against independent checksum calculations. They are not
-installed product tests and do not validate WFP metadata, injection, PnP/power
-transitions, kernel teardown or end-to-end application traffic.
+The standard TestLab CLI lifecycle/route/payload/source gates also confirmed
+13,536/13,536 proxied IPv4 echoes across repeated OFF/PROXY series, one/two
+streams and shared/distinct origins, with observed CPU/RAM coverage and verified
+driver detachment. Those tests used an explicitly identified TestLab CLI with
+unbuffered output and main-thread shutdown, identical for both Core versions.
+They measured local paced echo traffic, not maximum throughput. The old Core
+returned the wrong source endpoint and mixed clients; its timings are not a
+correctness-equivalent performance baseline. No speed advantage is claimed.
 
-Before acceptance, run a fresh bounded physical-target trial with a matching
-signed package and recovery baseline: IPv4/IPv6, implicit/wildcard/concrete bind,
-connected/sendto, two clients/one remote, one client/multiple remotes and local
-addresses, endpoint reuse, direct/block rules, owner stop/crash and cancellation.
-Then measure loss, latency tails, throughput, CPU, memory and handles under load.
-Do not infer a performance improvement from the architecture or isolated probes.
+Release builds, native driver analysis, standalone INF verification and catalog/
+signature checks passed. The WDK package-verifier task was unavailable; this is
+not current HLK/DVL certification. Physical install/restart and rollback checked
+the loaded SYS hash, PnP version and final baseline Stopped/Disabled state.
+Package 1.1.0.0 has the same executable sections as the benchmarked driver;
+its INF/PE version distinguishes it from the old package in DriverStore. Use a
+distinct package version when changing a binary; do not reuse a published INF
+identity for different SYS files.
+
+External network paths, multiple local addresses on a single endpoint,
+long-duration/high-load behavior, power transitions, kernel pool/handle trends
+and owner-crash policy remain outside these local gates. Existing owner cleanup
+disables filtering after Core exit; persistent fail-closed behavior is not added.
+TestLab also reproduced an existing TCP DIRECT-to-proxy route defect in both
+versions. It was not changed by this UDP work and remains unresolved. Full
+product acceptance must account for these limitations.
