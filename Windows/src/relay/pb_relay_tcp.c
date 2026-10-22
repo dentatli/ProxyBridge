@@ -1,5 +1,160 @@
 #include "pb_internal.h"
 
+// Keep accepting while process/rule lookup and reporting run on one setup worker.
+// This bounded queue owns accepted sockets until a connection worker takes over.
+#define TCP_SETUP_QUEUE_CAPACITY 512
+
+typedef struct {
+    SOCKET socket;
+    UINT16 source_port;
+    BOOL is_ipv6;
+    BOOL use_wfp_driver;
+} TCP_ACCEPTED_CONNECTION;
+
+typedef struct {
+    SRWLOCK lock;
+    HANDLE ready;
+    HANDLE worker;
+    volatile LONG stopping;
+    unsigned int head, count;
+    TCP_ACCEPTED_CONNECTION entries[TCP_SETUP_QUEUE_CAPACITY];
+} TCP_SETUP_QUEUE;
+
+static BOOL prepare_tcp_connection(const TCP_ACCEPTED_CONNECTION *accepted,
+                                   CONNECTION_CONFIG *config)
+{
+    config->client_socket = accepted->socket;
+    config->is_ipv6 = accepted->is_ipv6;
+    if (!accepted->use_wfp_driver)
+    {
+        return accepted->is_ipv6
+            ? get_connection_full_v6(accepted->source_port, FALSE, config->orig_dest_ip6,
+                                     &config->orig_dest_port, &config->proxy_config_id)
+            : get_connection_full(accepted->source_port, FALSE, &config->orig_dest_ip,
+                                  &config->orig_dest_port, &config->proxy_config_id);
+    }
+
+    DWORD pid = 0;
+    BOOL have_dest = accepted->is_ipv6
+        ? pb_driver_orig_dest6(accepted->socket, config->orig_dest_ip6, &config->orig_dest_port, &pid)
+        : pb_driver_orig_dest(accepted->socket, &config->orig_dest_ip, &config->orig_dest_port, &pid);
+    if (!have_dest)
+    {
+        int error = WSAGetLastError();
+        log_message("[RELAY] redirect-context query FAILED (WSA %d) - dropping", error);
+        return FALSE;
+    }
+
+    char pname[MAX_PROCESS_NAME];
+    UINT32 cfg = 0;
+    RuleAction act = RULE_ACTION_PROXY;
+    if (get_process_name_from_pid(pid, pname, sizeof(pname)))
+        act = accepted->is_ipv6
+            ? match_rule_v6(pname, config->orig_dest_ip6, config->orig_dest_port, FALSE, &cfg)
+            : match_rule(pname, config->orig_dest_ip, config->orig_dest_port, FALSE, &cfg);
+    config->proxy_config_id = cfg;
+    if (!accepted->is_ipv6)
+    {
+        struct in_addr da; da.S_un.S_addr = config->orig_dest_ip;
+        log_message("[RELAY] accepted redirect: pid=%lu dest=%s:%u action=%d cfg=%u",
+                    pid, inet_ntoa(da), config->orig_dest_port, act, cfg);
+    }
+    pb_report_connection(pid, NULL, accepted->is_ipv6, config->orig_dest_ip,
+                         accepted->is_ipv6 ? config->orig_dest_ip6 : NULL,
+                         config->orig_dest_port, act, cfg, FALSE);
+    return act != RULE_ACTION_BLOCK;
+}
+
+static DWORD WINAPI tcp_setup_worker(LPVOID arg)
+{
+    TCP_SETUP_QUEUE *queue = (TCP_SETUP_QUEUE *)arg;
+    for (;;)
+    {
+        WaitForSingleObject(queue->ready, INFINITE);
+        for (;;)
+        {
+            TCP_ACCEPTED_CONNECTION accepted;
+            AcquireSRWLockExclusive(&queue->lock);
+            if (queue->count == 0)
+            {
+                ReleaseSRWLockExclusive(&queue->lock);
+                break;
+            }
+            accepted = queue->entries[queue->head];
+            queue->head = (queue->head + 1) % TCP_SETUP_QUEUE_CAPACITY;
+            --queue->count;
+            ReleaseSRWLockExclusive(&queue->lock);
+
+            if (InterlockedCompareExchange(&queue->stopping, 0, 0))
+            {
+                closesocket(accepted.socket);
+                continue;
+            }
+            CONNECTION_CONFIG *config = (CONNECTION_CONFIG *)calloc(1, sizeof(*config));
+            if (config != NULL && prepare_tcp_connection(&accepted, config) &&
+                !InterlockedCompareExchange(&queue->stopping, 0, 0))
+            {
+                HANDLE worker = CreateThread(NULL, 1, connection_handler, config, 0, NULL);
+                if (worker != NULL)
+                {
+                    CloseHandle(worker);
+                    continue; // connection_handler owns config and socket now.
+                }
+            }
+            closesocket(accepted.socket);
+            free(config);
+        }
+        if (InterlockedCompareExchange(&queue->stopping, 0, 0)) return 0;
+    }
+}
+
+static TCP_SETUP_QUEUE *start_tcp_setup_queue(void)
+{
+    TCP_SETUP_QUEUE *queue = (TCP_SETUP_QUEUE *)calloc(1, sizeof(*queue));
+    if (queue == NULL) return NULL;
+    InitializeSRWLock(&queue->lock);
+    queue->ready = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (queue->ready != NULL)
+    {
+        queue->worker = CreateThread(NULL, 0, tcp_setup_worker, queue, 0, NULL);
+        if (queue->worker != NULL) return queue;
+        CloseHandle(queue->ready);
+    }
+    free(queue);
+    return NULL;
+}
+
+static void queue_tcp_connection(TCP_SETUP_QUEUE *queue, SOCKET socket,
+                                 BOOL is_ipv6, UINT16 source_port)
+{
+    BOOL queued = FALSE;
+    AcquireSRWLockExclusive(&queue->lock);
+    if (queue->count < TCP_SETUP_QUEUE_CAPACITY)
+    {
+        unsigned int tail = (queue->head + queue->count) % TCP_SETUP_QUEUE_CAPACITY;
+        queue->entries[tail].socket = socket;
+        queue->entries[tail].source_port = source_port;
+        queue->entries[tail].is_ipv6 = is_ipv6;
+        queue->entries[tail].use_wfp_driver = g_use_wfp_driver;
+        ++queue->count;
+        queued = TRUE;
+    }
+    ReleaseSRWLockExclusive(&queue->lock);
+    if (queued) SetEvent(queue->ready);
+    else closesocket(socket); // overload is bounded and never guesses a route.
+}
+
+static void stop_tcp_setup_queue(TCP_SETUP_QUEUE *queue)
+{
+    InterlockedExchange(&queue->stopping, 1);
+    SetEvent(queue->ready);
+    WaitForSingleObject(queue->worker, INFINITE);
+    CloseHandle(queue->worker);
+    CloseHandle(queue->ready);
+    free(queue);
+}
+
+
 // TCP relay: accept loop, per-connection worker, and the two-way byte pump.
 
 DWORD WINAPI local_proxy_server(LPVOID arg)
@@ -75,6 +230,15 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
         }
     }
 
+    TCP_SETUP_QUEUE *setup_queue = start_tcp_setup_queue();
+    if (setup_queue == NULL)
+    {
+        closesocket(listen_sock);
+        if (listen_sock6 != INVALID_SOCKET) closesocket(listen_sock6);
+        WSACleanup();
+        return 1;
+    }
+
     log_message("Local proxy listening on port %d", g_local_relay_port);
 
     while (running)
@@ -96,57 +260,7 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
             SOCKET client_sock = accept(listen_sock, (struct sockaddr *)&client_addr, &addr_len);
 
             if (client_sock != INVALID_SOCKET)
-            {
-                CONNECTION_CONFIG *conn_config = (CONNECTION_CONFIG *)malloc(sizeof(CONNECTION_CONFIG));
-                if (conn_config != NULL)
-                {
-                    conn_config->client_socket = client_sock;
-                    conn_config->is_ipv6 = FALSE;
-
-                    BOOL have_dest;
-                    if (g_use_wfp_driver)
-                    {
-                        // Original dest + PID come from the driver's redirect context; the
-                        // rule engine here picks the proxy config (and could direct/block).
-                        DWORD pid = 0;
-                        have_dest = pb_driver_orig_dest(client_sock, &conn_config->orig_dest_ip,
-                                                        &conn_config->orig_dest_port, &pid);
-                        if (have_dest)
-                        {
-                            char pname[MAX_PROCESS_NAME];
-                            UINT32 cfg = 0;
-                            RuleAction act = RULE_ACTION_PROXY;
-                            if (get_process_name_from_pid(pid, pname, sizeof(pname)))
-                                act = match_rule(pname, conn_config->orig_dest_ip, conn_config->orig_dest_port, FALSE, &cfg);
-                            conn_config->proxy_config_id = cfg;
-                            struct in_addr da; da.S_un.S_addr = conn_config->orig_dest_ip;
-                            log_message("[RELAY] accepted redirect: pid=%lu dest=%s:%u action=%d cfg=%u",
-                                        pid, inet_ntoa(da), conn_config->orig_dest_port, act, cfg);
-                            pb_report_connection(pid, NULL, FALSE, conn_config->orig_dest_ip, NULL,
-                                                 conn_config->orig_dest_port, act, cfg, FALSE);
-                            if (act == RULE_ACTION_BLOCK) have_dest = FALSE;   // relay refuses
-                        }
-                        else
-                        {
-                            log_message("[RELAY] redirect-context query FAILED (WSA %d) - dropping", WSAGetLastError());
-                        }
-                    }
-                    else
-                    {
-                        UINT16 client_port = ntohs(client_addr.sin_port);
-                        have_dest = get_connection_full(client_port, FALSE, &conn_config->orig_dest_ip,
-                                                        &conn_config->orig_dest_port, &conn_config->proxy_config_id);
-                    }
-                    if (have_dest)
-                    {
-                        HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
-                        if (conn_thread != NULL) { CloseHandle(conn_thread); }
-                        else { closesocket(client_sock); free(conn_config); }
-                    }
-                    else { closesocket(client_sock); free(conn_config); }
-                }
-                else { closesocket(client_sock); }
-            }
+                queue_tcp_connection(setup_queue, client_sock, FALSE, ntohs(client_addr.sin_port));
         }
 
         if (listen_sock6 != INVALID_SOCKET && FD_ISSET(listen_sock6, &read_fds))
@@ -156,53 +270,13 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
             SOCKET client_sock6 = accept(listen_sock6, (struct sockaddr*)&client_addr6, &addr_len6);
 
             if (client_sock6 != INVALID_SOCKET)
-            {
-                CONNECTION_CONFIG *conn_config = (CONNECTION_CONFIG *)malloc(sizeof(CONNECTION_CONFIG));
-                if (conn_config != NULL)
-                {
-                    conn_config->client_socket = client_sock6;
-                    conn_config->is_ipv6 = TRUE;
-
-                    BOOL have_dest6;
-                    if (g_use_wfp_driver)
-                    {
-                        DWORD pid = 0;
-                        have_dest6 = pb_driver_orig_dest6(client_sock6, conn_config->orig_dest_ip6,
-                                                          &conn_config->orig_dest_port, &pid);
-                        if (have_dest6)
-                        {
-                            char pname[MAX_PROCESS_NAME];
-                            UINT32 cfg = 0;
-                            RuleAction act = RULE_ACTION_PROXY;
-                            if (get_process_name_from_pid(pid, pname, sizeof(pname)))
-                                act = match_rule_v6(pname, conn_config->orig_dest_ip6, conn_config->orig_dest_port, FALSE, &cfg);
-                            conn_config->proxy_config_id = cfg;
-                            pb_report_connection(pid, NULL, TRUE, 0, conn_config->orig_dest_ip6,
-                                                 conn_config->orig_dest_port, act, cfg, FALSE);
-                            if (act == RULE_ACTION_BLOCK) have_dest6 = FALSE;
-                        }
-                    }
-                    else
-                    {
-                        UINT16 client_port = ntohs(client_addr6.sin6_port);
-                        have_dest6 = get_connection_full_v6(client_port, FALSE, conn_config->orig_dest_ip6,
-                                                            &conn_config->orig_dest_port, &conn_config->proxy_config_id);
-                    }
-                    if (have_dest6)
-                    {
-                        HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
-                        if (conn_thread != NULL) { CloseHandle(conn_thread); }
-                        else { closesocket(client_sock6); free(conn_config); }
-                    }
-                    else { closesocket(client_sock6); free(conn_config); }
-                }
-                else { closesocket(client_sock6); }
-            }
+                queue_tcp_connection(setup_queue, client_sock6, TRUE, ntohs(client_addr6.sin6_port));
         }
     }
 
     closesocket(listen_sock);
     if (listen_sock6 != INVALID_SOCKET) closesocket(listen_sock6);
+    stop_tcp_setup_queue(setup_queue);
     WSACleanup();
     return 0;
 }
