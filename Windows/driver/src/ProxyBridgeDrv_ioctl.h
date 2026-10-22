@@ -31,10 +31,67 @@
 // Lets user mode log EVERY connection - direct/unwatched included - not just redirected ones.
 #define PBDRV_IOCTL_POP_EVENTS    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_READ_DATA)
 
+// Versioned datagram channel. Legacy QUERY_UDP is not a fallback for this ABI.
+#define PBDRV_IOCTL_UDP_CAPS      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_READ_DATA)
+#define PBDRV_IOCTL_UDP_READ      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_OUT_DIRECT, FILE_READ_DATA)
+#define PBDRV_IOCTL_UDP_WRITE     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define PBDRV_IOCTL_UDP_STATS     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x809, METHOD_BUFFERED, FILE_READ_DATA)
+#define PBDRV_UDP_ABI 1u
+#define PBDRV_UDP_MAX_PAYLOAD 65507u
+#define PBDRV_UDP_MAX_CONTROL 1024u
+#define PBDRV_UDP_BATCH_BYTES (256u * 1024u)
+#define PBDRV_UDP_DATA 1u
+#define PBDRV_UDP_CLOSED 2u
+#define PBDRV_UDP_RECEIVE 1u
+#define PBDRV_UDP_DIRECT 2u
+
 #define PBDRV_MAX_WATCH 1024
 #define PBDRV_NAME_LEN  260     // max image-file-name chars we match against (WCHAR)
 
 #pragma pack(push, 1)
+
+// Pointer-free packed records; bytes includes header + payload + ancillary data,
+// without inter-record padding.
+// Addresses are raw network bytes. Other fields (including ports) are host order.
+// IDs never repeat during a driver load; kernel endpoint handles never cross ABI.
+typedef struct _PBDRV_UDP_RECORD {
+    UINT32 bytes;
+    UINT32 version;
+    UINT16 kind;
+    UINT16 family;
+    UINT32 payloadBytes;
+    UINT64 endpointId;
+    UINT32 pid;
+    UINT32 compartment;
+    UINT32 interfaceIndex;
+    UINT32 subInterfaceIndex;
+    UINT32 remoteScope;
+    UINT16 localPort;
+    UINT16 remotePort;
+    UINT8 localAddress[16];
+    UINT8 remoteAddress[16];
+    UINT32 controlBytes; // outbound ancillary data follows payload; zero for RECEIVE/CLOSED
+} PBDRV_UDP_RECORD;
+
+typedef struct _PBDRV_UDP_CAPS {
+    UINT32 version;
+    UINT32 recordBytes;
+    UINT32 maxPayload;
+    UINT32 batchBytes;
+} PBDRV_UDP_CAPS;
+typedef char PBDRV_UDP_RECORD_LAYOUT[(sizeof(PBDRV_UDP_RECORD) == 84) ? 1 : -1];
+
+typedef struct _PBDRV_UDP_STATS {
+    UINT64 captured;
+    UINT64 delivered;
+    UINT64 queueDrops;
+    UINT64 allocationDrops;
+    UINT64 invalidMetadata;
+    UINT64 staleWrites;
+    UINT64 injected;
+    UINT64 injectionErrors;
+    UINT64 endpointLimit;
+} PBDRV_UDP_STATS;
 
 // The watch list: image file-name suffixes whose outbound connections the driver redirects
 // to the relay. The GUI-managed proxy rules stay entirely in user mode; user mode derives
@@ -60,6 +117,7 @@ typedef struct _PBDRV_CONFIG {
     UINT32 redirectLoopbackApps;             // 1 = also redirect apps talking to 127.x/::1 (MITM), 0 = leave loopback alone
     UINT32 redirectUdp;                      // 0 = leave UDP direct (TCP-only mode)
     UINT32 redirectIpv6;                     // 0 = leave IPv6 direct (IPv4-only mode)
+    UINT32 udpAbi;                           // must equal PBDRV_UDP_ABI; old Core fails closed at configure
 } PBDRV_CONFIG;
 
 // Attached to each redirect as localRedirectContext; the relay reads it back with

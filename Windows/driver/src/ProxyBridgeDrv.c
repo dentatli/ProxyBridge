@@ -22,6 +22,7 @@
 
 #include "ProxyBridgeDrv_ioctl.h"
 #include "pbdrv_state.h"
+#include "pbdrv_udp.h"
 
 // Diagnostics: DebugView/WinDbg only in checked (DBG) builds; compiled out of Release.
 #if DBG
@@ -94,6 +95,22 @@ static BOOLEAN IsWatched(const WCHAR *imagePath, ULONG imageChars)
     return watched;
 }
 
+BOOLEAN PbUdpSelected(UINT16 family, UINT32 pid, const void *application, const UINT8 *remote)
+{
+    PBDRV_CONFIG cfg;
+    KIRQL irql = ExAcquireSpinLockShared(&gCfgLock);
+    cfg = gConfig;
+    BOOLEAN enabled = InterlockedCompareExchange(&gEnabled, 0, 0) != 0;
+    ExReleaseSpinLockShared(&gCfgLock, irql);
+    if (!enabled || !cfg.redirectUdp || pid == cfg.selfPid || (family == AF_INET6 && !cfg.redirectIpv6)) return FALSE;
+    if (!cfg.redirectLoopbackApps && (family == AF_INET ? remote[0] == 127 : IsLoopbackV6(remote))) return FALSE;
+    const FWP_BYTE_BLOB *app = application;
+    ULONG chars = app && app->data ? app->size / sizeof(WCHAR) : 0;
+    const WCHAR *path = chars ? (const WCHAR *)app->data : NULL;
+    while (chars && !path[chars - 1]) --chars;
+    return IsWatched(path, chars);
+}
+
 static void ClassifyCore(
     ADDRESS_FAMILY family,
     const FWPS_INCOMING_VALUES0     *inFixed,
@@ -127,6 +144,9 @@ static void ClassifyCore(
 
     if (inFixed->incomingValue[idxProto].value.type != FWP_UINT8) return;
     UINT8 protocol = inFixed->incomingValue[idxProto].value.uint8;
+    // UDP is captured at DATAGRAM_DATA with immutable per-packet addresses.
+    // Never send it through the legacy source->last-destination map.
+    if (protocol == IPPROTO_UDP) return;
     if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) return;
     if (protocol == IPPROTO_UDP && !cfg.redirectUdp)   return;   // TCP-only unless enabled
     if (family   == AF_INET6    && !cfg.redirectIpv6)  return;   // IPv4-only unless enabled
@@ -455,6 +475,9 @@ NTSTATUS PbWfpStart(PDEVICE_OBJECT dev)
     status = AddMonitorCallout(dev, &PB_MON_CALLOUT_V6_GUID, &FWPM_LAYER_ALE_AUTH_CONNECT_V6, MonitorV6, &gMonCalloutV6Id, &gMonFilterV6Id);
     if (!NT_SUCCESS(status)) { FwpmTransactionAbort0(gEngine); return status; }
 
+    status = PbUdpStart(dev, gEngine, &PB_PROVIDER_GUID, &PB_SUBLAYER_GUID);
+    if (!NT_SUCCESS(status)) { FwpmTransactionAbort0(gEngine); return status; }
+
     status = FwpmTransactionCommit0(gEngine);
     if (!NT_SUCCESS(status)) { FwpmTransactionAbort0(gEngine); return status; }
 
@@ -493,6 +516,8 @@ NTSTATUS PbWfpStop(void)
         if (!NT_SUCCESS(status) && NT_SUCCESS(result)) result = status;
     }
     if (!NT_SUCCESS(result)) return result;
+    result = PbUdpStop();
+    if (!NT_SUCCESS(result)) return result;
     if (gRedirect)       { FwpsRedirectHandleDestroy0(gRedirect);       gRedirect = NULL; }
     if (gWfpDeviceReference != NULL) {
         PDEVICE_OBJECT dev = gWfpDeviceReference;
@@ -526,11 +551,23 @@ NTSTATUS PbDeviceControl(ULONG code, PVOID input, ULONG inLen,
     ULONG_PTR info = 0;
     KIRQL old;
     switch (code) {
+    case PBDRV_IOCTL_UDP_CAPS:
+        if (outputLength < sizeof(PBDRV_UDP_CAPS)) return STATUS_BUFFER_TOO_SMALL;
+        {
+            PBDRV_UDP_CAPS caps = {PBDRV_UDP_ABI, sizeof(PBDRV_UDP_RECORD), PBDRV_UDP_MAX_PAYLOAD, PBDRV_UDP_BATCH_BYTES};
+            RtlCopyMemory(output, &caps, sizeof(caps)); info = sizeof(caps);
+        }
+        break;
+    case PBDRV_IOCTL_UDP_STATS:
+        if (outputLength < sizeof(PBDRV_UDP_STATS)) return STATUS_BUFFER_TOO_SMALL;
+        PbUdpStats(output); info = sizeof(PBDRV_UDP_STATS); break;
+    case PBDRV_IOCTL_UDP_WRITE:
+        status = PbUdpWrite(input, inLen); break;
     case PBDRV_IOCTL_SET_CONFIG:
         if (inLen < sizeof(PBDRV_CONFIG)) { status = STATUS_BUFFER_TOO_SMALL; break; }
         {
             const PBDRV_CONFIG *config = (const PBDRV_CONFIG *)buf;
-            if (config->selfPid == 0 || config->tcpV4Port == 0 ||
+            if (config->udpAbi != PBDRV_UDP_ABI || config->selfPid == 0 || config->tcpV4Port == 0 ||
                 config->redirectUdp > 1 || config->redirectIpv6 > 1 ||
                 config->redirectLoopbackApps > 1 || !IsLoopbackV4(config->tcpV4Addr) ||
                 (config->redirectUdp && (config->udpV4Port == 0 || !IsLoopbackV4(config->udpV4Addr))) ||

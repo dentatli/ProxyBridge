@@ -4,6 +4,7 @@
 #include <wdf.h>
 #include "ProxyBridgeDrv_ioctl.h"
 #include "pbdrv_device.h"
+#include "pbdrv_udp.h"
 
 static const GUID PBDRV_INTERFACE_GUID =
     {0x7c1b6a10,0x2e44,0x4e8b,{0x9e,0x21,0x0f,0x9a,0x5d,0x3c,0x1a,0x08}};
@@ -174,12 +175,19 @@ void PbEvtIoDeviceControl(WDFQUEUE queue, WDFREQUEST request, size_t outputLengt
     }
 
     PB_FILE_CONTEXT *file = PbFileContext(fileObject);
-    if (code == PBDRV_IOCTL_QUERY_UDP || code == PBDRV_IOCTL_POP_EVENTS) {
+    if (code == PBDRV_IOCTL_QUERY_UDP || code == PBDRV_IOCTL_POP_EVENTS ||
+        code == PBDRV_IOCTL_UDP_CAPS || code == PBDRV_IOCTL_UDP_STATS ||
+        code == PBDRV_IOCTL_UDP_WRITE || code == PBDRV_IOCTL_UDP_READ) {
         // Existing map/ring locks protect the actual data. No WFP API or
         // lifecycle mutex on the UDP lookup path.
         if (!ExAcquireRundownProtection(&file->requests)) {
             status = STATUS_FILE_CLOSED;
             goto complete;
+        }
+        if (code == PBDRV_IOCTL_UDP_READ && InterlockedCompareExchange(&file->valid, 0, 0)) {
+            PbUdpRead(request);
+            ExReleaseRundownProtection(&file->requests);
+            return; // manual queue owns completion/cancellation
         }
         if (InterlockedCompareExchange(&file->valid, 0, 0))
             status = PbDeviceControl(code, input, (ULONG)inputLength,
@@ -303,6 +311,8 @@ NTSTATUS PbEvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT deviceInit)
     queue.PowerManaged = WdfFalse;
     queue.EvtIoDeviceControl = PbEvtIoDeviceControl;
     status = WdfIoQueueCreate(device, &queue, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
+    if (!NT_SUCCESS(status)) return status;
+    status = PbUdpDeviceInit(device);
     if (!NT_SUCCESS(status)) return status;
     status = WdfDeviceCreateDeviceInterface(device, &PBDRV_INTERFACE_GUID, NULL);
     if (!NT_SUCCESS(status)) return status;

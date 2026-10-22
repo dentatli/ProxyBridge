@@ -154,21 +154,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
         return FALSE;
     }
 
-    if (any_socks5_config())
-    {
-        udp_relay_thread = CreateThread(NULL, 1, udp_relay_server, NULL, 0, NULL);
-        if (udp_relay_thread == NULL)
-        {
-            running = FALSE;
-            WaitForSingleObject(cleanup_thread, INFINITE);
-            CloseHandle(cleanup_thread);
-            cleanup_thread = NULL;
-            WaitForSingleObject(proxy_thread, INFINITE);
-            CloseHandle(proxy_thread);
-            proxy_thread = NULL;
-            return FALSE;
-        }
-    }
+    // The versioned UDP channel is started by pb_driver_start after ABI negotiation.
 
     Sleep(500);
 
