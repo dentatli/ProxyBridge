@@ -91,6 +91,15 @@ typedef struct _PBDRV_UDP_STATS {
     UINT64 injected;
     UINT64 injectionErrors;
     UINT64 endpointLimit;
+    // Last failed injection, captured as one snapshot. Stage: 1=submit, 2=complete.
+    UINT64 lastErrorStatus;
+    UINT64 lastErrorStage;
+    UINT64 lastErrorEndpoint;
+    UINT64 lastErrorFamily;
+    UINT64 lastErrorKind;
+    UINT64 lastErrorCompartment;
+    UINT64 lastErrorInterface;
+    UINT64 lastErrorSubInterface;
 } PBDRV_UDP_STATS;
 
 // The watch list: image file-name suffixes whose outbound connections the driver redirects

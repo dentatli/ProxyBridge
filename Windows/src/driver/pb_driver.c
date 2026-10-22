@@ -33,9 +33,14 @@ static DWORD WINAPI driver_event_drain(LPVOID arg)
             if (pbdrv_control(g_drv, PBDRV_IOCTL_UDP_STATS, NULL, 0, &stats, sizeof(stats), &bytes) && bytes == sizeof(stats)) {
                 if (stats.queueDrops != previous.queueDrops || stats.allocationDrops != previous.allocationDrops ||
                     stats.invalidMetadata != previous.invalidMetadata || stats.injectionErrors != previous.injectionErrors ||
-                    stats.endpointLimit != previous.endpointLimit || stats.staleWrites != previous.staleWrites)
+                    stats.endpointLimit != previous.endpointLimit || stats.staleWrites != previous.staleWrites) {
                     log_message("UDP driver: queue_drop=%llu alloc_drop=%llu metadata=%llu inject_error=%llu endpoint_limit=%llu stale=%llu",
                         stats.queueDrops,stats.allocationDrops,stats.invalidMetadata,stats.injectionErrors,stats.endpointLimit,stats.staleWrites);
+                    if (stats.injectionErrors != previous.injectionErrors)
+                        log_message("UDP injection failure: status=0x%08llX stage=%llu endpoint=%llu family=%llu kind=%llu compartment=%llu interface=%llu subinterface=%llu",
+                            stats.lastErrorStatus,stats.lastErrorStage,stats.lastErrorEndpoint,stats.lastErrorFamily,
+                            stats.lastErrorKind,stats.lastErrorCompartment,stats.lastErrorInterface,stats.lastErrorSubInterface);
+                }
                 previous = stats;
             }
         }
@@ -291,6 +296,7 @@ BOOL pb_driver_start(UINT16 relay_port)
     }
 
     log_message("driver: ProxyBridgeDrv active - relay 127.0.0.1:%u, TCP+UDP, IPv4+IPv6", relay_port);
+    log_message("driver: UDP packet channel active (ABI %u)", PBDRV_UDP_ABI);
     return TRUE;
 }
 

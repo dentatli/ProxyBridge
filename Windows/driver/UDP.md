@@ -72,6 +72,20 @@ is a separate product policy/lifecycle decision and is not claimed here.
 
 ## Validation status
 
+Physical Windows 11 testing on 2026-10-22 found that a freshly allocated
+loopback reply submitted to transport receive completed with
+`STATUS_DATA_NOT_ACCEPTED` (0xC000021B). Replies with both addresses in software
+loopback now use network send injection, preserving the original source tuple;
+other replies retain transport receive. Separate network injection handles are
+checked for self-injection and drained/destroyed on teardown. Last injection
+failure status, stage and routing metadata are exposed with the counters.
+
+The bounded physical trial passed 12/12 IPv4/IPv6 socket/bind variants and the
+two-clients/one-origin isolation check, with matching signed SYS/Core identities
+and verified rollback. This is a functional gate, not a throughput or resource
+benchmark; non-loopback receive injection and the remaining cases below still
+require validation.
+
 Release Core/CLI and KMDF compile/link, standalone INF verification and native
 driver code analysis are performed in the TestLab checkout. Lab-only probes
 exercise actual Core IOCP/SOCKS code through a simulated device seam and the

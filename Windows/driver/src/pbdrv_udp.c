@@ -37,6 +37,7 @@ typedef struct INJECTION {
     NET_BUFFER_LIST *nbl;
     PMDL mdl;
     ULONG bytes;
+    PBDRV_UDP_RECORD record; // immutable metadata for asynchronous error reporting
     FWPS_TRANSPORT_SEND_PARAMS0 send;
     UINT8 remote[16];
     UINT8 data[1];
@@ -51,6 +52,7 @@ static BOOLEAN gActive, gWorkQueued;
 static WDFQUEUE gReads;
 static WDFWORKITEM gWork;
 static HANDLE gInject4, gInject6, gNblPool;
+static HANDLE gLoopback4, gLoopback6;
 static UINT32 gCallouts[6];
 __declspec(align(8)) static PBDRV_UDP_STATS gStats;
 static EX_RUNDOWN_REF gWriters;
@@ -295,6 +297,8 @@ static void NTAPI Datagram(const FWPS_INCOMING_VALUES0 *v, const FWPS_INCOMING_M
         !(out->rights & FWPS_RIGHT_ACTION_WRITE) || data == NULL) return;
     FWPS_PACKET_INJECTION_STATE state = FwpsQueryPacketInjectionState0(v6 ? gInject6 : gInject4, data, NULL);
     if (state == FWPS_PACKET_INJECTED_BY_SELF || state == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF) return;
+    state = FwpsQueryPacketInjectionState0(v6 ? gLoopback6 : gLoopback4, data, NULL);
+    if (state == FWPS_PACKET_INJECTED_BY_SELF || state == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF) return;
     if (!FWPS_IS_METADATA_FIELD_PRESENT(m, FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE)) {
         InterlockedIncrement64((LONG64 *)&gStats.invalidMetadata); return;
     }
@@ -392,10 +396,25 @@ static void FreeInjection(INJECTION *i)
     if (--gInjectCount == 0) KeSetEvent(&gInjectIdle, IO_NO_INCREMENT, FALSE);
     KeReleaseSpinLock(&gLock, irql);
 }
+static void InjectionError(const PBDRV_UDP_RECORD *r, NTSTATUS status, UINT64 stage)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&gLock, &irql);
+    InterlockedIncrement64((LONG64 *)&gStats.injectionErrors);
+    gStats.lastErrorStatus = (UINT32)status;
+    gStats.lastErrorStage = stage;
+    gStats.lastErrorEndpoint = r->endpointId;
+    gStats.lastErrorFamily = r->family;
+    gStats.lastErrorKind = r->kind;
+    gStats.lastErrorCompartment = r->compartment;
+    gStats.lastErrorInterface = r->interfaceIndex;
+    gStats.lastErrorSubInterface = r->subInterfaceIndex;
+    KeReleaseSpinLock(&gLock, irql);
+}
 static void NTAPI InjectComplete(void *context, NET_BUFFER_LIST *nbl, BOOLEAN dispatch)
 {
     UNREFERENCED_PARAMETER(dispatch);
-    if (!NT_SUCCESS(NET_BUFFER_LIST_STATUS(nbl))) InterlockedIncrement64((LONG64 *)&gStats.injectionErrors);
+    if (!NT_SUCCESS(NET_BUFFER_LIST_STATUS(nbl))) InjectionError(&((INJECTION *)context)->record, NET_BUFFER_LIST_STATUS(nbl), 2);
     else InterlockedIncrement64((LONG64 *)&gStats.injected);
     FreeInjection(context);
 }
@@ -443,6 +462,7 @@ static NTSTATUS WritePacket(const PBDRV_UDP_RECORD *r, ULONG length)
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     i->bytes = allocated;
+    i->record = *r;
     (void)PbUdpBuildDatagram(r, i->data);
     i->mdl = IoAllocateMdl(i->data, bytes, FALSE, FALSE, NULL);
     if (!i->mdl) { FreeInjection(i); return STATUS_INSUFFICIENT_RESOURCES; }
@@ -450,7 +470,19 @@ static NTSTATUS WritePacket(const PBDRV_UDP_RECORD *r, ULONG length)
     NTSTATUS status = FwpsAllocateNetBufferAndNetBufferList0(gNblPool, 0, 0, i->mdl, 0, bytes, &i->nbl);
     if (!NT_SUCCESS(status)) { FreeInjection(i); return status; }
     HANDLE inject = r->family == AF_INET ? gInject4 : gInject6;
-    if (receive) status = FwpsInjectTransportReceiveAsync0(inject, NULL, NULL, 0, r->family,
+    // Loopback packets must traverse the local send path. Injecting a newly
+    // allocated loopback-source packet as received data fails source validation.
+    BOOLEAN loopback = FALSE;
+    if (receive && r->family == AF_INET)
+        loopback = r->localAddress[0] == 127 && r->remoteAddress[0] == 127;
+    else if (receive) {
+        static const UINT8 loop[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+        loopback = RtlCompareMemory(r->localAddress, loop, 16) == 16 &&
+                   RtlCompareMemory(r->remoteAddress, loop, 16) == 16;
+    }
+    if (loopback) status = FwpsInjectNetworkSendAsync0(r->family == AF_INET ? gLoopback4 : gLoopback6,
+        NULL, 0, r->compartment, i->nbl, InjectComplete, i);
+    else if (receive) status = FwpsInjectTransportReceiveAsync0(inject, NULL, NULL, 0, r->family,
         r->compartment, r->interfaceIndex, r->subInterfaceIndex, i->nbl, InjectComplete, i);
     else {
         RtlCopyMemory(i->remote, r->remoteAddress, 16);
@@ -463,7 +495,7 @@ static NTSTATUS WritePacket(const PBDRV_UDP_RECORD *r, ULONG length)
         status = FwpsInjectTransportSendAsync0(inject, NULL, saved.handle, 0, &i->send,
             r->family, r->compartment, i->nbl, InjectComplete, i);
     }
-    if (!NT_SUCCESS(status)) { InterlockedIncrement64((LONG64 *)&gStats.injectionErrors); FreeInjection(i); }
+    if (!NT_SUCCESS(status)) { InjectionError(r, status, 1); FreeInjection(i); }
     return status;
 }
 
@@ -509,6 +541,10 @@ NTSTATUS PbUdpStart(PDEVICE_OBJECT device, HANDLE engine, const GUID *provider, 
     if (!NT_SUCCESS(status)) return status;
     status = FwpsInjectionHandleCreate0(AF_INET6, FWPS_INJECTION_TYPE_TRANSPORT, &gInject6);
     if (!NT_SUCCESS(status)) return status;
+    status = FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_NETWORK, &gLoopback4);
+    if (!NT_SUCCESS(status)) return status;
+    status = FwpsInjectionHandleCreate0(AF_INET6, FWPS_INJECTION_TYPE_NETWORK, &gLoopback6);
+    if (!NT_SUCCESS(status)) return status;
     const GUID *keys[] = {&UDP_AUTH4,&UDP_AUTH6,&UDP_DATA4,&UDP_DATA6,&UDP_CLOSE4,&UDP_CLOSE6};
     const GUID *layers[] = {&FWPM_LAYER_ALE_AUTH_CONNECT_V4,&FWPM_LAYER_ALE_AUTH_CONNECT_V6,
         &FWPM_LAYER_DATAGRAM_DATA_V4,&FWPM_LAYER_DATAGRAM_DATA_V6,&FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V4,&FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V6};
@@ -539,6 +575,8 @@ NTSTATUS PbUdpStop(void)
     KeWaitForSingleObject(&gInjectIdle, Executive, KernelMode, FALSE, NULL);
     if (gInject4) { FwpsInjectionHandleDestroy0(gInject4); gInject4 = NULL; }
     if (gInject6) { FwpsInjectionHandleDestroy0(gInject6); gInject6 = NULL; }
+    if (gLoopback4) { FwpsInjectionHandleDestroy0(gLoopback4); gLoopback4 = NULL; }
+    if (gLoopback6) { FwpsInjectionHandleDestroy0(gLoopback6); gLoopback6 = NULL; }
     if (gNblPool) { NdisFreeNetBufferListPool(gNblPool); gNblPool = NULL; }
     PbUdpReset();
     gStarted = FALSE;
@@ -556,8 +594,11 @@ void PbUdpReset(void)
 }
 void PbUdpStats(PBDRV_UDP_STATS *stats)
 {
+    KIRQL irql;
+    KeAcquireSpinLock(&gLock, &irql);
     // Counters are aligned in the module even though the wire layout is packed.
     LONG64 *out = (LONG64 *)stats, *in = (LONG64 *)&gStats;
     for (ULONG n = 0; n < sizeof(gStats) / sizeof(LONG64); ++n)
         out[n] = InterlockedCompareExchange64(&in[n], 0, 0);
+    KeReleaseSpinLock(&gLock, irql);
 }
