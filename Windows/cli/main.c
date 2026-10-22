@@ -459,11 +459,9 @@ static BOOL WINAPI ctrl_handler(DWORD ev)
 {
     if (ev == CTRL_C_EVENT || ev == CTRL_BREAK_EVENT || ev == CTRL_CLOSE_EVENT)
     {
-        if (InterlockedExchange(&g_running, 0))
-        {
-            printf("\nStopping ProxyBridge...\n");
-            if (g_Stop) g_Stop();
-        }
+        // Request shutdown only. The main thread owns Stop and DLL lifetime;
+        // unloading here or in parallel can race Core's asynchronous workers.
+        InterlockedExchange(&g_running, 0);
         return TRUE;
     }
     return FALSE;
@@ -967,14 +965,24 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    SetConsoleCtrlHandler(ctrl_handler, TRUE);
     InterlockedExchange(&g_running, 1);
+    if (!SetConsoleCtrlHandler(ctrl_handler, TRUE))
+    {
+        fprintf(stderr, "ERROR: Failed to register console control handler (%lu).\n", GetLastError());
+        g_Stop();
+        return 1;
+    }
     printf("ProxyBridge is running. Press Ctrl+C to stop.\n\n");
+    fflush(stdout); // readiness must also reach pipes and ConPTY immediately
 
     while (InterlockedCompareExchange(&g_running, 0, 0) != 0)
         Sleep(200);
 
-    printf("ProxyBridge stopped.\n\n");
-    FreeLibrary(g_hDll);
-    return 0;
+    printf("\nStopping ProxyBridge...\n");
+    BOOL stopped = g_Stop != NULL && g_Stop();
+    if (stopped) printf("ProxyBridge stopped.\n\n");
+    else fprintf(stderr, "ERROR: ProxyBridge_Stop failed.\n");
+    // Process exit reclaims the DLL. Do not unload it beneath any detached
+    // worker whose termination is not proven by the public Stop result.
+    return stopped && fflush(stdout) == 0 && !ferror(stdout) && !ferror(stderr) ? 0 : 1;
 }
