@@ -271,6 +271,8 @@ static void SocketReady(SESSION *s, const struct sockaddr_storage *relay, int re
         CloseSession(s); return;
     }
     s->ready = TRUE;
+    log_message("UDP ASSOCIATE established with SOCKS5 proxy %s:%u (endpoint=%llu config=%u)",
+        s->config.host,s->config.port,s->endpoint,s->configId);
     while (s->first && !s->closing) {
         PENDING *p = s->first; s->first = p->next;
         s->pendingBytes -= p->record.bytes; gPendingBytes -= p->record.bytes;
