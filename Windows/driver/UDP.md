@@ -99,6 +99,12 @@ They measured local paced echo traffic, not maximum throughput. The old Core
 returned the wrong source endpoint and mixed clients; its timings are not a
 correctness-equivalent performance baseline. No speed advantage is claimed.
 
+The final native product CLI also passed three ConPTY startup/graceful-stop
+cycles and 1,536/1,536 additional two-stream echoes with matching package 1.1.0.0.
+Its startup message is explicitly flushed; main owns Stop and retains the DLL
+until process exit instead of racing the console-control handler. The earlier
+version comparison still uses identical instrumented CLIs for comparability.
+
 Release builds, native driver analysis, standalone INF verification and catalog/
 signature checks passed. The WDK package-verifier task was unavailable; this is
 not current HLK/DVL certification. Physical install/restart and rollback checked
