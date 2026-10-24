@@ -42,13 +42,16 @@
       <AdditionalDependencies>%(AdditionalDependencies);fwpkclnt.lib;ndis.lib</AdditionalDependencies>
     </Link>
     <Inf>
-      <TimeStamp>1.0.0.1</TimeStamp>
+      <TimeStamp>1.1.0.0</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\ProxyBridgeDrv.c" />
     <ClCompile Include="src\pbdrv_state.c" />
     <ClCompile Include="src\pbdrv_device.c" />
+    <ClCompile Include="src\pbdrv_udp.c" />
+    <ClInclude Include="src\pbdrv_udp.h" />
+    <ClInclude Include="src\pbdrv_udp_packet.h" />
     <ClInclude Include="src\pbdrv_device.h" />
     <ClInclude Include="src\pbdrv_state.h" />
     <ClInclude Include="src\ProxyBridgeDrv_ioctl.h" />

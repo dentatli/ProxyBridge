@@ -21,9 +21,29 @@ static DWORD WINAPI driver_event_drain(LPVOID arg)
     const DWORD CAP = 256;
     PBDRV_EVENT *buf = (PBDRV_EVENT *)malloc(CAP * sizeof(PBDRV_EVENT));
     if (buf == NULL) return 0;
+    ULONGLONG statsAt = 0;
+    PBDRV_UDP_STATS previous = {0};
 
     while (g_drain_run)
     {
+        ULONGLONG now = GetTickCount64();
+        if (now - statsAt >= 1000) {
+            PBDRV_UDP_STATS stats = {0}; DWORD bytes = 0;
+            statsAt = now;
+            if (pbdrv_control(g_drv, PBDRV_IOCTL_UDP_STATS, NULL, 0, &stats, sizeof(stats), &bytes) && bytes == sizeof(stats)) {
+                if (stats.queueDrops != previous.queueDrops || stats.allocationDrops != previous.allocationDrops ||
+                    stats.invalidMetadata != previous.invalidMetadata || stats.injectionErrors != previous.injectionErrors ||
+                    stats.endpointLimit != previous.endpointLimit || stats.staleWrites != previous.staleWrites) {
+                    log_message("UDP driver: queue_drop=%llu alloc_drop=%llu metadata=%llu inject_error=%llu endpoint_limit=%llu stale=%llu",
+                        stats.queueDrops,stats.allocationDrops,stats.invalidMetadata,stats.injectionErrors,stats.endpointLimit,stats.staleWrites);
+                    if (stats.injectionErrors != previous.injectionErrors)
+                        log_message("UDP injection failure: status=0x%08llX stage=%llu endpoint=%llu family=%llu kind=%llu compartment=%llu interface=%llu subinterface=%llu",
+                            stats.lastErrorStatus,stats.lastErrorStage,stats.lastErrorEndpoint,stats.lastErrorFamily,
+                            stats.lastErrorKind,stats.lastErrorCompartment,stats.lastErrorInterface,stats.lastErrorSubInterface);
+                }
+                previous = stats;
+            }
+        }
         DWORD got = 0;
         if (g_drv != INVALID_HANDLE_VALUE && pbdrv_pop_events(g_drv, buf, CAP, &got) && got > 0)
         {
@@ -205,6 +225,7 @@ static void driver_build_config(PBDRV_CONFIG *cfg, UINT16 relay_port)
     cfg->selfPid            = GetCurrentProcessId();
     cfg->redirectUdp        = 1;
     cfg->redirectIpv6       = 1;
+    cfg->udpAbi             = PBDRV_UDP_ABI;
     cfg->redirectLoopbackApps = g_localhost_via_proxy ? 1 : 0;   // "Localhost via Proxy" menu option
 }
 
@@ -229,6 +250,14 @@ BOOL pb_driver_start(UINT16 relay_port)
     }
 
     PBDRV_CONFIG cfg;
+    PBDRV_UDP_CAPS caps = {0}; DWORD capsBytes = 0;
+    if (!pbdrv_control(g_drv, PBDRV_IOCTL_UDP_CAPS, NULL, 0, &caps, sizeof(caps), &capsBytes) ||
+        capsBytes != sizeof(caps) || caps.version != PBDRV_UDP_ABI ||
+        caps.recordBytes != sizeof(PBDRV_UDP_RECORD) || caps.maxPayload != PBDRV_UDP_MAX_PAYLOAD ||
+        caps.batchBytes != PBDRV_UDP_BATCH_BYTES) {
+        log_message("driver: incompatible UDP packet ABI; install the matching driver package");
+        CloseHandle(g_drv); g_drv = INVALID_HANDLE_VALUE; SetLastError(ERROR_REVISION_MISMATCH); return FALSE;
+    }
     driver_build_config(&cfg, relay_port);
     if (!pbdrv_configure(g_drv, &cfg)) {
         DWORD error = GetLastError();
@@ -253,16 +282,27 @@ BOOL pb_driver_start(UINT16 relay_port)
         return FALSE;
     }
 
+    if (!pb_udp_start(g_drv)) {
+        pbdrv_enable(g_drv, FALSE);
+        CloseHandle(g_drv); g_drv = INVALID_HANDLE_VALUE; return FALSE;
+    }
+
     // Start the connection-log drain (logs every connection: direct/proxy/block).
     g_drain_run = TRUE;
     g_drain_thread = CreateThread(NULL, 0, driver_event_drain, NULL, 0, NULL);
+    if (!g_drain_thread) {
+        g_drain_run = FALSE; pb_udp_stop(); pbdrv_enable(g_drv, FALSE);
+        CloseHandle(g_drv); g_drv = INVALID_HANDLE_VALUE; return FALSE;
+    }
 
     log_message("driver: ProxyBridgeDrv active - relay 127.0.0.1:%u, TCP+UDP, IPv4+IPv6", relay_port);
+    log_message("driver: UDP packet channel active (ABI %u)", PBDRV_UDP_ABI);
     return TRUE;
 }
 
 void pb_driver_stop(void)
 {
+    pb_udp_stop(); // cancel/drain every packet I/O before closing the owner handle
     // Stop the drain thread before closing the handle it uses. Wait INFINITE (not a timeout):
     // the thread reads g_drv, so closing it while the thread is mid pbdrv_pop_events() would be
     // a use-after-close. The loop checks g_drain_run every <=150 ms, so this returns promptly.

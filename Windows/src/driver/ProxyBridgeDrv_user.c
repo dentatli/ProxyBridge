@@ -22,13 +22,28 @@
 HANDLE pbdrv_open(void)
 {
     return CreateFileW(PBDRV_USER_PATH, GENERIC_READ | GENERIC_WRITE,
-                       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+                       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+}
+
+BOOL pbdrv_control(HANDLE h, DWORD code, void *input, DWORD inputBytes,
+                    void *output, DWORD outputBytes, DWORD *returned)
+{
+    OVERLAPPED ov = {0};
+    HANDLE event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!event) return FALSE;
+    // Low event bit suppresses IOCP notification for these synchronous control
+    // operations: their stack OVERLAPPED must never enter the UDP event loop.
+    ov.hEvent = (HANDLE)((ULONG_PTR)event | 1);
+    BOOL ok = DeviceIoControl(h, code, input, inputBytes, output, outputBytes, returned, &ov);
+    if (!ok && GetLastError() == ERROR_IO_PENDING) ok = GetOverlappedResult(h, &ov, returned, TRUE);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(event); SetLastError(error); return ok;
 }
 
 BOOL pbdrv_configure(HANDLE h, const PBDRV_CONFIG *cfg)
 {
     DWORD ret = 0;
-    return DeviceIoControl(h, PBDRV_IOCTL_SET_CONFIG, (LPVOID)cfg, sizeof(*cfg), NULL, 0, &ret, NULL);
+    return pbdrv_control(h, PBDRV_IOCTL_SET_CONFIG, (LPVOID)cfg, sizeof(*cfg), NULL, 0, &ret);
 }
 
 // Push the watch list (image-name suffixes to redirect). User mode derives this from the
@@ -38,20 +53,20 @@ BOOL pbdrv_set_watchlist(HANDLE h, const PBDRV_WATCHLIST *wl)
 {
     DWORD ret = 0;
     DWORD len = (DWORD)(FIELD_OFFSET(PBDRV_WATCHLIST, entries) + (SIZE_T)wl->count * sizeof(PBDRV_WATCH_ENTRY));
-    return DeviceIoControl(h, PBDRV_IOCTL_SET_WATCHLIST, (LPVOID)wl, len, NULL, 0, &ret, NULL);
+    return pbdrv_control(h, PBDRV_IOCTL_SET_WATCHLIST, (LPVOID)wl, len, NULL, 0, &ret);
 }
 
 BOOL pbdrv_enable(HANDLE h, BOOL on)
 {
     DWORD ret = 0;
-    return DeviceIoControl(h, on ? PBDRV_IOCTL_ENABLE : PBDRV_IOCTL_DISABLE, NULL, 0, NULL, 0, &ret, NULL);
+    return pbdrv_control(h, on ? PBDRV_IOCTL_ENABLE : PBDRV_IOCTL_DISABLE, NULL, 0, NULL, 0, &ret);
 }
 
 // Query a redirected UDP flow's original destination by its source endpoint (in/out `q`).
 BOOL pbdrv_udp_query(HANDLE h, PBDRV_UDP_QUERY *q)
 {
     DWORD ret = 0;
-    return DeviceIoControl(h, PBDRV_IOCTL_QUERY_UDP, q, sizeof(*q), q, sizeof(*q), &ret, NULL) && ret >= sizeof(*q);
+    return pbdrv_control(h, PBDRV_IOCTL_QUERY_UDP, q, sizeof(*q), q, sizeof(*q), &ret) && ret >= sizeof(*q);
 }
 
 // Drain the driver's connection-event ring into buf[0..maxCount). Returns the count via *got.
@@ -59,8 +74,8 @@ BOOL pbdrv_udp_query(HANDLE h, PBDRV_UDP_QUERY *q)
 BOOL pbdrv_pop_events(HANDLE h, PBDRV_EVENT *buf, DWORD maxCount, DWORD *got)
 {
     DWORD ret = 0;
-    BOOL ok = DeviceIoControl(h, PBDRV_IOCTL_POP_EVENTS, NULL, 0,
-                              buf, maxCount * (DWORD)sizeof(PBDRV_EVENT), &ret, NULL);
+    BOOL ok = pbdrv_control(h, PBDRV_IOCTL_POP_EVENTS, NULL, 0,
+                              buf, maxCount * (DWORD)sizeof(PBDRV_EVENT), &ret);
     *got = ok ? (ret / (DWORD)sizeof(PBDRV_EVENT)) : 0;
     return ok;
 }
@@ -79,8 +94,5 @@ BOOL pbdrv_get_original_dest(SOCKET accepted, PBDRV_REDIRECT_CTX *ctx)
     return FALSE;
 }
 
-// For UDP: the relay's UDP socket receives redirected datagrams. Use
-// SIO_QUERY_WFP_CONNECTION_REDIRECT_RECORDS on the socket, or associate the per-datagram
-// endpoint the same way; the driver's context carries the original dest either way.
-// (Reply datagrams the relay sends back are un-redirected by WFP to appear from the
-//  original destination, so the app's recvfrom() sees the expected source.)
+// UDP uses the separate versioned packet channel; it has no accepted socket
+// and must not infer per-datagram ownership from a shared UDP socket's context.

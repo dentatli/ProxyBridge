@@ -14,6 +14,10 @@ extern "C" {
 
 // Open \\.\ProxyBridgeDrv. Returns INVALID_HANDLE_VALUE if the driver isn't running.
 HANDLE pbdrv_open(void);
+BOOL pbdrv_control(HANDLE h, DWORD code, void *input, DWORD inputBytes,
+                    void *output, DWORD outputBytes, DWORD *returned);
+BOOL pb_udp_start(HANDLE driver);
+void pb_udp_stop(void);
 
 // Push relay endpoints + selfPid (config) and the process watch list to the driver.
 BOOL pbdrv_configure(HANDLE h, const PBDRV_CONFIG *cfg);
