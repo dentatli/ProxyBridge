@@ -25,6 +25,7 @@ static BOOL prepare_tcp_connection(const TCP_ACCEPTED_CONNECTION *accepted,
 {
     config->client_socket = accepted->socket;
     config->is_ipv6 = accepted->is_ipv6;
+    config->action = RULE_ACTION_PROXY; // Legacy conntrack contains only proxied connections.
     if (!accepted->use_wfp_driver)
     {
         return accepted->is_ipv6
@@ -53,6 +54,7 @@ static BOOL prepare_tcp_connection(const TCP_ACCEPTED_CONNECTION *accepted,
             ? match_rule_v6(pname, config->orig_dest_ip6, config->orig_dest_port, FALSE, &cfg)
             : match_rule(pname, config->orig_dest_ip, config->orig_dest_port, FALSE, &cfg);
     config->proxy_config_id = cfg;
+    config->action = act;
     if (!accepted->is_ipv6)
     {
         struct in_addr da; da.S_un.S_addr = config->orig_dest_ip;
@@ -285,6 +287,7 @@ DWORD WINAPI connection_handler(LPVOID arg)
 {
     CONNECTION_CONFIG *config = (CONNECTION_CONFIG *)arg;
     SOCKET client_sock = config->client_socket;
+    RuleAction action = config->action;
     UINT32 dest_ip = config->orig_dest_ip;
     UINT16 dest_port = config->orig_dest_port;
     UINT32 proxy_config_id = config->proxy_config_id;
@@ -295,6 +298,52 @@ DWORD WINAPI connection_handler(LPVOID arg)
     struct sockaddr_in socks_addr;
 
     free(config);
+
+    // DIRECT is an explicit route, independent of proxy configuration or availability.
+    if (action == RULE_ACTION_DIRECT)
+    {
+        struct sockaddr_storage destination;
+        int destination_size;
+        memset(&destination, 0, sizeof(destination));
+        if (is_ipv6)
+        {
+            struct sockaddr_in6 *address = (struct sockaddr_in6 *)&destination;
+            address->sin6_family = AF_INET6;
+            address->sin6_port = htons(dest_port);
+            memcpy(&address->sin6_addr, dest_ip6, 16);
+            destination_size = sizeof(*address);
+        }
+        else
+        {
+            struct sockaddr_in *address = (struct sockaddr_in *)&destination;
+            address->sin_family = AF_INET;
+            address->sin_port = htons(dest_port);
+            address->sin_addr.s_addr = dest_ip;
+            destination_size = sizeof(*address);
+        }
+        socks_sock = socket(is_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (socks_sock == INVALID_SOCKET)
+        {
+            closesocket(client_sock);
+            return 1;
+        }
+        configure_tcp_socket(socks_sock, 4194304, 30000);
+        configure_tcp_socket(client_sock, 4194304, 30000);
+        if (connect_with_timeout(socks_sock, (struct sockaddr *)&destination,
+                                 destination_size, 30000) == SOCKET_ERROR)
+        {
+            log_message("[RELAY] DIRECT connection failed - dropping without proxy fallback");
+            closesocket(socks_sock);
+            closesocket(client_sock);
+            return 1;
+        }
+        goto relay_connected;
+    }
+    if (action != RULE_ACTION_PROXY)
+    {
+        closesocket(client_sock);
+        return 1;
+    }
 
     // Snapshot the proxy config so this thread is immune to a concurrent Edit/Delete while it
     // uses the settings across the (blocking) SOCKS5/HTTP handshake below.
@@ -386,6 +435,7 @@ DWORD WINAPI connection_handler(LPVOID arg)
         }
     }
 
+relay_connected:;
     // Disable timeout for data transfer phase
     DWORD zero_timeout = 0;
     setsockopt(socks_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&zero_timeout, sizeof(zero_timeout));

@@ -100,6 +100,7 @@ typedef struct CONNECTION_INFO {
 
 typedef struct {
     SOCKET client_socket;
+    RuleAction action;
     UINT32 orig_dest_ip;
     UINT16 orig_dest_port;
     UINT32 proxy_config_id;
